@@ -1,0 +1,248 @@
+// ────────────────────────────────────────────────────────────────────────
+//                                          Pump V18
+//                              Ultimate 3 Modes Pump Operation
+//                                    Pulsative Operation
+//                                Toggle Switch Mode-Selector
+//                                          3 Knobs
+//                                      Flow Sensor + LCD
+// ────────────────────────────────────────────────────────────────────────
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// --- shared pin defs ---
+const int modeContPin   = 4;
+const int modePulsePin  = 5;
+const int modeSinPin    = 6;        // We don't need this, it activates by 'else' statement
+
+// Pin Definitions
+const int switchPin  = 2;           // Switch Input - Turns Pump ON/OFF
+const int in1        = 8;           // in1 and in2 gives motor direction
+const int in2        = 9;
+const int ena        = 10;          // Pump Control Pin on L298N
+
+const int speedPin  = A0;           // A0 varies amplitude
+const int cyclePin  = A1;           // A1 varies Cycle duration
+const int onTimePin = A2;           // A2 varies ON duration
+
+
+const int minPWM = int(0.25 * 255); // Maximum Speed Lower Limit
+const int maxPWM = 255;             // Maximum Speed Upper Limit
+
+const unsigned long minCycle = 1000;
+const unsigned long maxCycle = 2500;
+// Shared sine-period variable for Sin.
+
+// Pots Variable
+int amplitude;
+unsigned long cyclePeriod, onDuration, offDuration;
+
+bool pumpOn               = true;   // Tracks where Pump is curently running
+unsigned long phaseStart  = 0;       // timestamp when current phase began
+bool isOnPhase            = false;   // true if in ON part of the pulse
+
+// Instantaneous timing
+volatile unsigned int pulseCount = 0;                             // For Sin/Pulse
+volatile unsigned long lastPulseTime = 0;                         // For Cont.
+volatile unsigned long pulseInterval = 0;  // µs between pulses
+
+// For toggle
+const unsigned long debounceDelay = 50;   // debounce window
+int lastButtonReading       = HIGH;
+int stableButtonState       = HIGH;
+unsigned long lastDebounceTime = 0;
+
+// Flow meter + LCD Declarations
+const int flowMeterPin           = 3;     // Flow-meter signal
+const int pulsesPerLiter         = 400;   // Calibration
+unsigned long previousMillis     = 0;
+unsigned long interval     = 200;   // 400 ms → 2.5 updates/sec
+
+// For flow plotting
+unsigned long sensorInterval = 10;  // 20 ms sampling
+unsigned long lastSensorMillis     = 0;
+unsigned long sensorIntervalLcd = 20; // a new parameter for LCD display
+
+// float displayFlow = 0.0;          // holds the smoothed value
+// const float alpha = 0.01;          // smoothing factor (10%)
+
+// Cont. smoothing globals
+float smoothedFlow       = 0.0;
+float lcdSmoothedFlow    = 0.0;
+const float smoothingFactor = 0.1;
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+void pulseCounter() {
+  // Sin/Pulse behaviour:
+  pulseCount++;
+
+  // Cont. behaviours:
+  unsigned long now = micros();
+  pulseInterval = now - lastPulseTime;
+  lastPulseTime = now;
+}
+
+// // --- forward declarations ---
+void runCont();
+void runSin();
+void runPulse();
+
+void setup() {
+
+    // init version-select pins
+    pinMode(modeContPin, INPUT_PULLUP);
+    pinMode(modeSinPin, INPUT_PULLUP);
+    pinMode(modePulsePin, INPUT_PULLUP);
+
+    // Initialize Motor Control Pins
+    pinMode(in1, OUTPUT);
+    pinMode(in2, OUTPUT);
+    pinMode(ena, OUTPUT);
+
+    // Pump initially OFF, Forward
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    analogWrite(ena, 0);               // 0-255 Duty Cycle of Arduino PWM
+
+    // — Toggle ON-OFF button ————————————————
+    pinMode(switchPin, INPUT_PULLUP); // pressed = LOW
+
+    // Flow-meter interrupt + LCD init
+    pinMode(flowMeterPin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(flowMeterPin), pulseCounter, RISING);
+
+    // Initialize I²C & Serial
+    Wire.begin();
+    Serial.begin(9600);
+    delay(100);
+
+    // LCD Setup
+    lcd.begin(16, 2);
+    lcd.backlight();
+    lcd.setCursor(0, 0);
+    lcd.print("Flow (L/min):");
+
+    phaseStart = millis();             // Current time snapshot [Needed to keep track of cycles]
+    previousMillis = millis();         // for flow‐upda
+}
+
+void loop() {
+
+  unsigned long now = millis();   // Debounce with 'now'
+
+  // ——— Global Switching ——————————————————————
+  // Read switch: LOW = ON, HIGH = OFF (because of INPUT_PULLUP)
+  bool pumpOn = (digitalRead(switchPin) == LOW);
+
+  // read selector
+
+  if (!pumpOn) {
+    analogWrite(ena, 0);
+  }
+  else {
+    if (digitalRead(modeContPin) == LOW) {
+      runCont();                           // Continuous 
+    }
+    else if (digitalRead(modePulsePin) == LOW) {
+      runPulse();                           // Pulsative
+    }
+    else {
+      runSin();  // (middle throws none → Sin) --- Sinusoidal
+  }
+  }
+
+    // ——— Global speed & timing knobs ——————————————————————
+  amplitude   = map( analogRead(speedPin), 1023, 0, minPWM, maxPWM );
+  cyclePeriod = map( analogRead(cyclePin), 1023, 0, minCycle, maxCycle );
+  onDuration  = map( analogRead(onTimePin), 0, 1023, cyclePeriod*5/100, cyclePeriod*95/100 );
+  offDuration = cyclePeriod - onDuration;
+
+    // ───────── Flow Sensor Plotting ─────────────────────────────────────────────
+  if (now - lastSensorMillis >= sensorInterval) {
+    noInterrupts();
+    unsigned int pulses = pulseCount;
+    pulseCount = 0;
+    interrupts();
+
+    float flowLPerMin = pulses * (60000.0 / sensorInterval) / pulsesPerLiter;
+    float lcdFlowPerMin = pulses * (60000.0 / sensorIntervalLcd) / pulsesPerLiter;
+ 
+   // apply exponential smoothing to flatten out the PWM envelope
+    smoothedFlow = smoothingFactor * flowLPerMin + (1.0 - smoothingFactor) * smoothedFlow;
+    lcdSmoothedFlow = smoothingFactor * lcdFlowPerMin + (1.0 - smoothingFactor) * lcdSmoothedFlow;
+
+
+    // print the raw flow reading
+    Serial.println(smoothedFlow, 3);
+    lcd.setCursor(0, 1);
+    lcd.print(lcdSmoothedFlow, 3);
+    lcd.print("   ");
+
+    lastSensorMillis = now;
+  }
+}
+
+// _____________________________________________________________________________________________________________________________________________________________________
+// _____________________________________________________________________________________________________________________________________________________________________
+// _____________________________________________________________________________________________________________________________________________________________________
+
+void runCont() {
+
+  if (pumpOn) {
+    analogWrite(ena, amplitude);        // Speed as per value of PWM (Pot Knob)
+  }
+}
+
+// _____________________________________________________________________________________________________________________________________________________________________
+// _____________________________________________________________________________________________________________________________________________________________________
+// _____________________________________________________________________________________________________________________________________________________________________
+
+void runSin() {
+
+  unsigned long noww = millis();       // Current time snapshot [Needed to keep track of cycles]
+
+  // _______ 1. Compute sine-wave PWM value  ________________________________________________________
+  float phase     = ((noww % cyclePeriod) / float(cyclePeriod)) * TWO_PI;  // Phase 0→2π  
+  float sineValue = (sin(phase) + 1.0) / 2.0;                       // Normalize to 0→1  
+  int   minPWM    = 128;                  // 50% Speed
+  int   span      = amplitude - minPWM;
+  int   pwmValue  = minPWM + int(sineValue * span);               // Final duty cycle
+
+  // _______ 2. Variable Speed ______________________________________________________________________
+  if (pumpOn) {
+    analogWrite(ena, pwmValue);        // Speed as per value of PWM (Pot Knob)
+  }
+}
+
+// _____________________________________________________________________________________________________________________________________________________________________
+// _____________________________________________________________________________________________________________________________________________________________________
+// _____________________________________________________________________________________________________________________________________________________________________
+
+void runPulse() {
+
+// _______ 1. Pulse Signal Logic __________________________________________________________________
+if (pumpOn) {
+    unsigned long now       = millis();
+    unsigned long elapsed   = now - phaseStart;
+
+    if (isOnPhase) {
+        // Check for end of ON-phase
+        if (elapsed >= onDuration) {
+            isOnPhase  = false;
+            phaseStart = now;
+        }
+        // Continuously update speed during ON-phase
+        analogWrite(ena, amplitude);
+    } 
+    else {
+        // Check for end of OFF-phase
+        if (elapsed >= offDuration) {
+            isOnPhase  = true;
+            phaseStart = now;
+        }
+        // Keep pump off during OFF-phase
+        analogWrite(ena, 0);
+    }
+}
+}
