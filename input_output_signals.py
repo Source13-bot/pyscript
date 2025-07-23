@@ -10,7 +10,8 @@ from matplotlib.widgets import Button
 
 # ─── USER-TUNABLE SMOOTHING ───────────────────────────────────────
 alpha = 0.3          # EMA smoothing factor (0 < alpha ≤ 1)
-smoothed_flow = None  # holds the last EMA output
+smoothed_flow = None  # holds the last EMA output ekrem is played with this line
+
 
 # ─── CONFIGURE SERIAL PORT ────────────────────────────────────────
 # Match Arduino’s COM port and baud; non-blocking reads
